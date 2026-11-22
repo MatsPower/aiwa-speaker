@@ -1,0 +1,139 @@
+#!/usr/bin/env bash
+# Uppdaterar NQPTP och Shairport Sync till senaste stabila version, och sig själv.
+# Körs av aiwa-update.timer. Flaggor: --build (första bygget), --force, --no-self-update
+set -uo pipefail
+
+STATE=/var/lib/aiwa
+SRC=/usr/local/src
+CONF=/etc/aiwa-update.conf
+SELF=/usr/local/sbin/aiwa-update
+SCRIPT_URL=""
+# shellcheck disable=SC1090
+[[ -f "$CONF" ]] && . "$CONF"
+mkdir -p "$STATE" "$SRC"
+
+MODE=update
+SELF_UPDATE=1
+for a in "$@"; do
+  case "$a" in
+    --build) MODE=build ;;
+    --force) MODE=force ;;
+    --no-self-update) SELF_UPDATE=0 ;;
+  esac
+done
+
+log() {
+  echo "[aiwa-update] $*"
+  logger -t aiwa-update -- "$*" || true
+}
+
+# Senaste stabila taggen (t.ex. 5.6.3). Ignorerar -dev/-rc och gamla v/V-taggar.
+latest_tag() {
+  git ls-remote --tags --refs "$1" 2>/dev/null | sed 's|.*refs/tags/||' \
+    | grep -E '^[0-9]+(\.[0-9]+)+$' | sort -V | tail -1
+}
+
+systemd_flag() {
+  if ./configure --help | grep -q -- '--with-systemd-startup'; then
+    echo "--with-systemd-startup"
+  else
+    echo "--with-systemd"
+  fi
+}
+
+build() {
+  local name=$1 url=$2 tag=$3
+  shift 3
+  local dir="$SRC/$name"
+  rm -rf "$dir"
+  git clone --quiet "$url" "$dir" || return 1
+  cd "$dir" || return 1
+  git checkout --quiet "$tag" || return 1
+  autoreconf -fi >/dev/null || return 1
+  ./configure "$@" "$(systemd_flag)" >/dev/null || return 1
+  nice -n 19 make -j2 >/dev/null || return 1
+  make install >/dev/null || return 1
+}
+
+update_component() {
+  local name=$1 url=$2 bin=$3 service=$4
+  shift 4
+  local tag current failed
+  tag=$(latest_tag "$url")
+  if [[ -z "$tag" ]]; then
+    log "$name: kunde inte hämta versioner"
+    [[ "$MODE" == build ]] && return 1
+    return 0
+  fi
+  current=$(cat "$STATE/$name.version" 2>/dev/null || true)
+  failed=$(cat "$STATE/$name.failed" 2>/dev/null || true)
+  if [[ "$MODE" == update && "$tag" == "$current" ]]; then
+    log "$name: $tag är redan senaste"
+    return 0
+  fi
+  if [[ "$MODE" == update && "$tag" == "$failed" ]]; then
+    log "$name: $tag misslyckades tidigare, väntar på nyare version"
+    return 0
+  fi
+  log "$name: ${current:-ny} -> $tag"
+  [[ -x "$bin" ]] && cp -a "$bin" "$STATE/$name.bak"
+  if ! build "$name" "$url" "$tag" "$@"; then
+    log "$name: bygget av $tag misslyckades"
+    [[ -f "$STATE/$name.bak" ]] && cp -a "$STATE/$name.bak" "$bin"
+    echo "$tag" > "$STATE/$name.failed"
+    return 1
+  fi
+  if [[ "$MODE" == build ]]; then
+    echo "$tag" > "$STATE/$name.version"
+    return 0
+  fi
+  systemctl daemon-reload
+  systemctl restart "$service"
+  sleep 15
+  if systemctl is-active --quiet "$service"; then
+    echo "$tag" > "$STATE/$name.version"
+    rm -f "$STATE/$name.failed"
+    log "$name: uppdaterad till $tag"
+    return 0
+  fi
+  log "$name: $tag startar inte, återställer föregående version"
+  [[ -f "$STATE/$name.bak" ]] && cp -a "$STATE/$name.bak" "$bin"
+  systemctl restart "$service"
+  echo "$tag" > "$STATE/$name.failed"
+  return 1
+}
+
+self_update() {
+  [[ -n "$SCRIPT_URL" ]] || return 0
+  case "$SCRIPT_URL" in
+    https://*) ;;
+    *) log "SCRIPT_URL måste börja med https://"; return 0 ;;
+  esac
+  local tmp
+  tmp=$(mktemp)
+  if curl -fsSL --max-time 60 -o "$tmp" "$SCRIPT_URL" && bash -n "$tmp" \
+     && head -1 "$tmp" | grep -q '^#!/usr/bin/env bash'; then
+    if ! cmp -s "$tmp" "$SELF"; then
+      install -m 755 "$tmp" "$SELF"
+      rm -f "$tmp"
+      log "uppdaterade sig själv från $SCRIPT_URL, kör om"
+      exec "$SELF" --no-self-update
+    fi
+  else
+    log "kunde inte hämta ett giltigt skript från $SCRIPT_URL"
+  fi
+  rm -f "$tmp"
+}
+
+if [[ "$SELF_UPDATE" == 1 && "$MODE" == update ]]; then
+  self_update
+fi
+
+rc=0
+update_component nqptp https://github.com/mikebrady/nqptp.git \
+  /usr/local/bin/nqptp nqptp.service || rc=1
+update_component shairport-sync https://github.com/mikebrady/shairport-sync.git \
+  /usr/local/bin/shairport-sync shairport-sync.service \
+  --sysconfdir=/etc --with-alsa --with-soxr --with-avahi \
+  --with-ssl=openssl --with-airplay-2 || rc=1
+exit $rc
