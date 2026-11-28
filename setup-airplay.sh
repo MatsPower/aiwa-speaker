@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
-# AirPlay 2-mottagare på Raspberry Pi Zero 2 W + PCM5102A (I2S-DAC)
-# Kör på nyinstallerat Raspberry Pi OS Lite (64-bit):
+# AirPlay 2-mottagare på Raspberry Pi Zero W / Zero 2 W + PCM5102A (I2S-DAC)
+# Kör på nyinstallerat Raspberry Pi OS Lite (32-bit på Zero W, 32- eller 64-bit på Zero 2 W):
 #   sudo bash setup-airplay.sh "Aiwa Kök"
 set -euo pipefail
 
@@ -20,6 +20,14 @@ SLUG="$(printf '%s' "$NAME" | LC_ALL=C.UTF-8 sed 's/[åä]/a/g; s/ö/o/g; s/[Å�
 if [[ -z "$SLUG" ]]; then
   SLUG="aiwa"
 fi
+
+echo "== 0/6 Fast Raspbian-spegel (Umeå) =="
+# Raspbians mirror-director kan välja spegelservrar som blockeras i brandväggen.
+# Lås till ACC Umeå. Påverkar bara 32-bitars Raspbian; 64-bit använder deb.debian.org.
+for f in /etc/apt/sources.list /etc/apt/sources.list.d/*.list /etc/apt/sources.list.d/*.sources; do
+  [[ -f "$f" ]] || continue
+  sed -i -E 's#raspbian\.raspberrypi\.(com|org)/raspbian#ftp.acc.umu.se/mirror/raspbian/raspbian#' "$f"
+done
 
 echo "== 1/6 Paket =="
 apt-get update
@@ -184,15 +192,23 @@ fi
 /usr/local/sbin/aiwa-update --build
 systemctl enable nqptp
 
-echo "== 3/6 I2S-DAC (PCM5102A) =="
+echo "== 3/6 I2S-DAC (PCM5102A) och Bluetooth av =="
 CONFIG=/boot/firmware/config.txt
 [[ -f "$CONFIG" ]] || CONFIG=/boot/config.txt
 sed -i 's/^dtparam=audio=on/#dtparam=audio=on/' "$CONFIG"
 grep -q '^dtoverlay=hifiberry-dac' "$CONFIG" || echo 'dtoverlay=hifiberry-dac' >> "$CONFIG"
+# Bluetooth stör 2,4 GHz-wifi och används inte.
+grep -q '^dtoverlay=disable-bt' "$CONFIG" || echo 'dtoverlay=disable-bt' >> "$CONFIG"
+systemctl disable hciuart bluetooth 2>/dev/null || true
 
 echo "== 4/6 Konfiguration =="
 hostnamectl set-hostname "$SLUG"
 sed -i "s/^127\.0\.1\.1.*/127.0.1.1\t$SLUG/" /etc/hosts
+# Zero W (ARMv6, en kärna) har för lite CPU för soxr-interpolering.
+INTERPOLATION=""
+if [[ "$(uname -m)" == armv6l ]]; then
+  INTERPOLATION=$'\tinterpolation = "basic";'
+fi
 [[ -f /etc/shairport-sync.conf && ! -f /etc/shairport-sync.conf.orig ]] && \
   cp /etc/shairport-sync.conf /etc/shairport-sync.conf.orig
 cat > /etc/shairport-sync.conf <<EOF
@@ -200,6 +216,7 @@ general =
 {
 	name = "$NAME";
 	playback_mode = "mono";
+$INTERPOLATION
 };
 
 alsa =
